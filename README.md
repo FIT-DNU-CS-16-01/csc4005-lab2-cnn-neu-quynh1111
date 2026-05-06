@@ -52,7 +52,7 @@ pip install -r requirements.txt
 ### Windows
 ```bash
 python -m venv .venv
-.venv\Scriptsctivate
+.venv\Scripts\activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -69,6 +69,11 @@ Hỗ trợ các kiểu dữ liệu sau:
 Ví dụ:
 ```bash
 python -m src.train --data_dir /duong_dan/NEU-CLS.zip --model_name cnn_small --train_mode scratch
+```
+
+Nếu bạn đã có thư mục dữ liệu ngay trong workspace (ví dụ `NEU-CLS/`), bạn có thể trỏ thẳng vào thư mục đó:
+```bash
+python -m src.train --data_dir NEU-CLS --model_name cnn_small --train_mode scratch
 ```
 
 ## 5. Chạy baseline CNN from scratch
@@ -121,6 +126,17 @@ Log cuối run:
 - trainable_params
 - confusion matrix image
 - curves image
+
+Ghi chú: nếu máy chưa `wandb login` hoặc mạng bị chặn, code sẽ tự fallback sang **offline mode**. Sau khi login, bạn có thể sync lại các run offline theo hướng dẫn trong `docs/WANDB_GUIDE.md`.
+
+## 9. Xuất bảng so sánh (metrics + thời gian/epoch)
+Sau khi chạy ít nhất 2 run (scratch và transfer), tạo bảng tổng hợp:
+```bash
+python -m src.summarize
+```
+Script sẽ tạo:
+- `outputs/summary.csv`
+- `outputs/summary.md`
 
 ## 9. Lưu ý về transfer learning
 Transfer learning trong starter kit dùng `torchvision`. Nếu gặp lỗi import `torchvision`, nguyên nhân thường là **torch / torchvision không tương thích phiên bản**.

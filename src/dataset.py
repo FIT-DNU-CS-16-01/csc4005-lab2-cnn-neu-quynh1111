@@ -177,6 +177,137 @@ def _scan_flat_images(root: Path) -> tuple[list[tuple[Path, int]], list[str]] | 
     return samples, class_names
 
 
+def _find_split_dir(root: Path, names: tuple[str, ...]) -> Path | None:
+    wanted = {n.lower() for n in names}
+    for child in root.iterdir():
+        if child.is_dir() and child.name.lower() in wanted:
+            return child
+    return None
+
+
+def _find_images_dir(split_dir: Path) -> Path | None:
+    # Common patterns in NEU-CLS starter datasets:
+    # - train/images
+    # - train/train/images
+    # - valid/images
+    # - valid/valid/images
+    direct = split_dir / 'images'
+    if direct.is_dir():
+        return direct
+
+    nested_same = split_dir / split_dir.name / 'images'
+    if nested_same.is_dir():
+        return nested_same
+
+    for child in split_dir.iterdir():
+        if child.is_dir():
+            maybe = child / 'images'
+            if maybe.is_dir():
+                return maybe
+    return None
+
+
+def _collect_labeled_images(root: Path) -> list[tuple[Path, str]]:
+    # Try "class folders" first.
+    class_dirs = [p for p in sorted(root.iterdir()) if p.is_dir()]
+    normalized: list[tuple[Path, str]] = []
+    for class_dir in class_dirs:
+        class_name = _normalize_label_name(class_dir.name)
+        if class_name is None:
+            normalized = []
+            break
+        normalized.append((class_dir, class_name))
+    if normalized:
+        labeled: list[tuple[Path, str]] = []
+        for class_dir, class_name in normalized:
+            for path in sorted(class_dir.rglob('*')):
+                if path.suffix.lower() in IMG_EXTENSIONS:
+                    labeled.append((path, class_name))
+        if labeled:
+            return labeled
+
+    # Fallback: infer labels from file name like "crazing_10.jpg".
+    image_paths = [p for p in sorted(root.rglob('*')) if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS]
+    labeled = []
+    for path in image_paths:
+        class_name = _infer_label_from_filename(path)
+        if class_name is None:
+            continue
+        labeled.append((path, class_name))
+    return labeled
+
+
+def _resolve_folder_splits(
+    root: Path,
+    val_size: float,
+    test_size: float,
+    random_state: int,
+) -> tuple[list[tuple[Path, int]], list[tuple[Path, int]], list[tuple[Path, int]], list[str]] | None:
+    train_dir = _find_split_dir(root, ('train',))
+    val_dir = _find_split_dir(root, ('valid', 'val'))
+    test_dir = _find_split_dir(root, ('test',))
+    if train_dir is None or val_dir is None:
+        return None
+
+    train_images = _find_images_dir(train_dir) or train_dir
+    val_images = _find_images_dir(val_dir) or val_dir
+    test_images = (_find_images_dir(test_dir) or test_dir) if test_dir is not None else None
+
+    train_labeled = _collect_labeled_images(train_images)
+    val_labeled = _collect_labeled_images(val_images)
+    test_labeled = _collect_labeled_images(test_images) if test_images is not None else []
+
+    if not train_labeled or not val_labeled:
+        return None
+
+    all_names = [name for _, name in (train_labeled + val_labeled + test_labeled)]
+    class_names = _ordered_class_names(all_names)
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
+
+    train_samples = [(p, class_to_idx[name]) for p, name in train_labeled]
+
+    if test_labeled:
+        val_samples = [(p, class_to_idx[name]) for p, name in val_labeled]
+        test_samples = [(p, class_to_idx[name]) for p, name in test_labeled]
+        return train_samples, val_samples, test_samples, class_names
+
+    # If there is no explicit test folder, split the provided validation folder into val/test.
+    if test_size <= 0:
+        val_samples = [(p, class_to_idx[name]) for p, name in val_labeled]
+        return train_samples, val_samples, val_samples, class_names
+
+    # Heuristic: some NEU-CLS packages provide an extremely small "valid" split (e.g., 5 images/class).
+    # In that case, keep valid as validation, and create a reasonable test split from the train set.
+    if len(val_labeled) < 50:
+        train_labels = [class_to_idx[name] for _, name in train_labeled]
+        train_paths = [str(p) for p, _ in train_labeled]
+        new_train_paths, test_paths, new_train_labels, test_labels = train_test_split(
+            train_paths,
+            train_labels,
+            test_size=test_size,
+            stratify=train_labels,
+            random_state=random_state,
+        )
+        new_train_samples = [(Path(p), y) for p, y in zip(new_train_paths, new_train_labels)]
+        test_samples = [(Path(p), y) for p, y in zip(test_paths, test_labels)]
+        val_samples = [(p, class_to_idx[name]) for p, name in val_labeled]
+        return new_train_samples, val_samples, test_samples, class_names
+
+    labels = [class_to_idx[name] for _, name in val_labeled]
+    paths = [str(p) for p, _ in val_labeled]
+    relative_test_size = test_size / max(val_size + test_size, 1e-8)
+    val_paths, test_paths, val_labels, test_labels = train_test_split(
+        paths,
+        labels,
+        test_size=relative_test_size,
+        stratify=labels,
+        random_state=random_state,
+    )
+    val_samples = [(Path(p), y) for p, y in zip(val_paths, val_labels)]
+    test_samples = [(Path(p), y) for p, y in zip(test_paths, test_labels)]
+    return train_samples, val_samples, test_samples, class_names
+
+
 def _resolve_samples(data_dir: str | Path) -> tuple[list[tuple[Path, int]], list[str], Path]:
     root = _extract_zip_if_needed(Path(data_dir))
     direct_scan = _scan_class_folders(root)
@@ -206,29 +337,39 @@ def create_dataloaders(
     num_channels: int = 1,
     normalization: str = 'none',
 ) -> SplitData:
-    samples, class_names, resolved_root = _resolve_samples(data_dir)
-    paths = [str(p) for p, _ in samples]
-    labels = [label for _, label in samples]
-
-    train_paths, temp_paths, train_labels, temp_labels = train_test_split(
-        paths,
-        labels,
-        test_size=val_size + test_size,
-        stratify=labels,
+    resolved_root = _extract_zip_if_needed(Path(data_dir))
+    folder_split = _resolve_folder_splits(
+        resolved_root,
+        val_size=val_size,
+        test_size=test_size,
         random_state=random_state,
     )
-    relative_test_size = test_size / (val_size + test_size)
-    val_paths, test_paths, val_labels, test_labels = train_test_split(
-        temp_paths,
-        temp_labels,
-        test_size=relative_test_size,
-        stratify=temp_labels,
-        random_state=random_state,
-    )
+    if folder_split is not None:
+        train_samples, val_samples, test_samples, class_names = folder_split
+    else:
+        samples, class_names, resolved_root = _resolve_samples(resolved_root)
+        paths = [str(p) for p, _ in samples]
+        labels = [label for _, label in samples]
 
-    train_samples = [(Path(p), y) for p, y in zip(train_paths, train_labels)]
-    val_samples = [(Path(p), y) for p, y in zip(val_paths, val_labels)]
-    test_samples = [(Path(p), y) for p, y in zip(test_paths, test_labels)]
+        train_paths, temp_paths, train_labels, temp_labels = train_test_split(
+            paths,
+            labels,
+            test_size=val_size + test_size,
+            stratify=labels,
+            random_state=random_state,
+        )
+        relative_test_size = test_size / (val_size + test_size)
+        val_paths, test_paths, val_labels, test_labels = train_test_split(
+            temp_paths,
+            temp_labels,
+            test_size=relative_test_size,
+            stratify=temp_labels,
+            random_state=random_state,
+        )
+
+        train_samples = [(Path(p), y) for p, y in zip(train_paths, train_labels)]
+        val_samples = [(Path(p), y) for p, y in zip(val_paths, val_labels)]
+        test_samples = [(Path(p), y) for p, y in zip(test_paths, test_labels)]
 
     train_ds = ImageDataset(
         train_samples,

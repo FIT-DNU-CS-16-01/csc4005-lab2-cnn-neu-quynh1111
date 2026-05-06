@@ -137,6 +137,11 @@ def main() -> None:
     )
     print(f'Resolved data directory: {data.resolved_data_dir}')
     print(f'Classes: {data.class_names}')
+    split_sizes = {
+        'n_train': len(data.train_loader.dataset),
+        'n_val': len(data.val_loader.dataset),
+        'n_test': len(data.test_loader.dataset),
+    }
 
     model = build_model(
         model_name=args.model_name,
@@ -153,22 +158,37 @@ def main() -> None:
     if args.use_wandb and wandb is None:
         print('Cảnh báo: chưa import được wandb. Chạy tiếp ở chế độ không log online.')
     if use_wandb:
-        wandb.init(project=args.project, name=args.run_name, config=vars(args))
-        wandb.config.update({
-            'num_classes': len(data.class_names),
-            'class_names': data.class_names,
-            'device': str(device),
-            'resolved_data_dir': data.resolved_data_dir,
-            'num_channels': num_channels,
-            'normalization': normalization,
-            'total_params': total_params,
-            'trainable_params': trainable_params,
-        })
+        try:
+            wandb.init(project=args.project, name=args.run_name, config=vars(args))
+        except Exception as exc:  # pragma: no cover - env/network/auth dependent
+            print(f'W&B init failed ({type(exc).__name__}). Fallback to offline mode...')
+            try:
+                try:
+                    wandb.finish()
+                except Exception:
+                    pass
+                wandb.init(project=args.project, name=args.run_name, config=vars(args), mode='offline')
+            except Exception as exc2:  # pragma: no cover
+                print(f'W&B offline init also failed ({type(exc2).__name__}). Disable W&B logging for this run.')
+                use_wandb = False
+        if use_wandb:
+            wandb.config.update({
+                'num_classes': len(data.class_names),
+                'class_names': data.class_names,
+                'device': str(device),
+                'resolved_data_dir': data.resolved_data_dir,
+                **split_sizes,
+                'num_channels': num_channels,
+                'normalization': normalization,
+                'total_params': total_params,
+                'trainable_params': trainable_params,
+            })
 
     history: list[dict[str, float]] = []
     early_stopper = EarlyStopping(patience=args.patience)
     best_val_loss = float('inf')
     best_val_acc = 0.0
+    best_epoch = 0
 
     for epoch in range(1, args.epochs + 1):
         start = time.perf_counter()
@@ -197,6 +217,7 @@ def main() -> None:
         if early_stopper.step(val_loss):
             best_val_loss = val_loss
             best_val_acc = val_acc
+            best_epoch = epoch
             torch.save(model.state_dict(), output_dir / 'best_model.pt')
         if early_stopper.should_stop:
             print(f'Early stopping at epoch {epoch}')
@@ -215,11 +236,13 @@ def main() -> None:
     metrics = {
         'model_name': args.model_name,
         'train_mode': args.train_mode,
+        'best_epoch': best_epoch,
         'best_val_loss': best_val_loss,
         'best_val_acc': best_val_acc,
         'test_loss': test_loss,
         'test_acc': test_acc,
         'avg_epoch_time_sec': avg_epoch_time,
+        **split_sizes,
         'total_params': total_params,
         'trainable_params': trainable_params,
         'class_names': data.class_names,
